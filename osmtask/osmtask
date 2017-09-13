@@ -1,0 +1,649 @@
+#!/usr/bin/python2.7
+
+import sys
+import os
+import re
+import argparse
+import subprocess
+import datetime
+import glob
+import shlex
+import shutil
+import time
+from time import sleep
+from posix import wait
+
+version = "1.2"
+
+# include licence.py
+# Text from licence.py
+
+copyright = "Copyright (c) 2017, Chris Baker <osdr@ctac.me.uk> \n"
+
+licence_short = copyright + "This software is made available under the MIT License, please use -l to display."
+
+licence_full = """
+MIT License
+
+""" + copyright + """
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+# include core.py
+# This is the core.py library include
+# We only want to distribute 1 file so we pre-process includes into 1 python file
+
+# It is possible that the program you are looking at does not use all
+# of these functions. This is a standard library block for all of the
+# OSDR tools.
+
+def default_check_environ(default, key, value):
+    # Allow shell environment variables to override defaults
+    # Set default[key]=value unless environment variable progname_key overrides
+
+    # Assume this program is called osersync, key is "rsync_user", value is "root"
+    # So set default["rsync_user"] = "root" or, if osersync_rsync_user exists,
+    # default["rsync_user"] = $osersync_rsync_user
+
+    # NB: If running this program using sudo, depending on how you set the env vars you may need sudo -E
+    
+    # Set progname_defaults to anything to list all defaults at runtime
+
+    progname = os.path.splitext(os.path.basename(__file__))[0]  # This prog name, extension removed
+
+    evarname = progname + "_" + key  # Program name (no extension) underscore key name
+
+    if evarname in os.environ:
+        default[key] = os.environ[evarname]
+    else:
+        default[key] = value
+        
+    if "%s_defaults" % progname in os.environ:  
+        verbose([ "* %s_defaults : default[%s] = %s" % (progname, key, default[key])], 0)
+
+    return
+
+def display(line):
+    # Print line to stdout
+    # Using display rather than just print allows us to process output (e.g.
+    # timestamp/flush) or redirect it
+
+    if ("args" in globals()) and args.time_stamp:  # Just in case display called bofore args set
+        dt_obj = datetime.datetime.now()
+        dt = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
+        line = dt + " " + line
+
+    print line
+    sys.stdout.flush()
+    return
+
+def verbose(msg_list, level=1):
+    # Display the incoming message if at, or below the current verbose level
+    # If we are -v (level 1) then only display level 1 messages, ignore level 2
+    # If we are -vv (level 2) then display both level 1 and 2
+    # If no -v options at all, we are at level 0 and skip all verbose messages
+
+    # If args is not set we are trying to print before setting up at the top
+    # of the code so just ignore the -v level and print anyway
+    
+    try:
+        args
+    except NameError:
+        True
+    else:
+        if args.verbose < level:
+            return
+
+    for l in msg_list:
+        display(l)
+
+    return
+
+def notify(alert_msg):
+    # Use the host notify program to send a notification to the administrator
+    
+    # As a common core function used by different programs try to be very 
+    # careful to check if the default global dictionary exists, if we have 
+    # a "notifier" member and if we have an args.notifier override.
+    
+    # Caution: alert() calls notify() so notify() must not call alert()
+
+    myfname = os.path.basename(sys.argv[0])  # Filename+extension of path used to call this program
+    myname = os.path.splitext(myfname)[0]  # Remove extension
+
+    notify_tag = "none"  # Disable notify as first step
+    
+    # Check if we have default and then if we have default["notifier"]
+    
+    try:
+        default
+    except NameError:
+        True
+    else:
+        if "notifier" in default:
+            notify_tag = default["notifier"]      
+    
+    # Check if we have args and then if we have args.notifier
+    
+    try:
+        args
+    except NameError:
+        True
+    else:
+        if hasattr(args, 'notifier'):
+            notify_tag = args.notifier
+    
+    # Check if there is a notifier override for all osdr tools
+    
+    if "osdr_notifier" in os.environ:
+        notify_tag = os.environ["osdr_notifier"]
+        
+    # Check if notifier is disabled
+
+    if ((not notify_tag) or (notify_tag.lower() == "none")) :
+        # Notifier disabled or not declared
+        return
+
+    verbose(["Notify: " + notify_tag], 2)  # Debug tracing
+    
+    # Next we check if notifier is built-in
+    # By convention, we use a leading @ to indicate select a built-in
+    # We still check to see if the built in exists and, if not, return quietly
+
+    if notify_tag.lower() == "@synology":
+        synology = "/usr/syno/bin/synodsmnotify"
+
+        if os.path.exists(synology):
+            # If we are on Synology use the synodsmnotify function
+            callcmdl([synology, "@administrators", myname, alert_msg])
+        return
+
+    # Add any new built-ins here using @synology as a template
+
+    # Not disabled, not built-in, try calling the program with 2 positional
+    # arguments, name and message. Likelihood is this is calling a user written
+    # external wrapper script around whatever actual function is being invoked.
+
+    if os.path.exists(notify_tag):
+        callcmdl([notify_tag, myname, alert_msg])
+    else:
+        # Do not call alert as alert calls notify
+        display("Requested notifier missing: " + notify_tag)
+
+    return
+
+def alert(alert_msg):
+    # Send message to both stdout and to notify, set global variable alert_triggered
+    # No need for stderr as dsm forwards both stdout and stderr by email and mixing
+    # stdout and stderr could mess up message sequence.
+
+    # Just about every fn could alert, don't want to hand this around on every
+    # call line
+
+    alert_msg = "> Alert: " + alert_msg  # > to make it easier to spot alerts in emailed output
+    notify(alert_msg)
+    display(alert_msg)
+
+    if "alerts_triggered" in globals():  # Just in case caller not counting alerts
+        global alerts_triggered
+        alerts_triggered += 1
+
+    return
+
+def abort(abort_msg):
+    # Use alert to send messages then exit non-zero
+
+    alert(abort_msg)
+    print "Terminating run"
+    sys.exit(1)
+    return
+
+def callcmdl(cmdlist):
+    # call command list: Run a linux command from a list of tokens
+    # Catch any non-zero return codes, convert the output to a list and return
+    # Caution: stderr will go out to main stderr
+
+    # First we do a security check, insist on full path for first argument
+    
+    exefile = cmdlist[0];
+    if not re.match(r'^/', exefile):
+        abort("callcmdl requires full path exe: " + exefile)
+        return
+        
+    cmdline = " ".join(cmdlist)  # Only used for printing, not running
+    verbose(["$ " + cmdline], 2)
+
+    rc = 0
+    try:
+        output = subprocess.check_output(cmdlist)
+    except subprocess.CalledProcessError as e:
+        rc = e.returncode
+        output = str(e.output)
+
+    if rc:
+        alert("Caution: non-zero return code from: " + cmdline)
+
+    output_list = output.split('\n')
+    output_list.pop()  # Remove final blank element
+
+    verbose(output_list, 2)
+    return output_list
+
+def callcmd(cmdstr):
+    # Run a single string command line.
+    # Split into tokens with shlex and hand off to callcmdl
+
+    # No need for verbose echo of cmdstr as callcmdl will do that for us
+
+    args = shlex.split(cmdstr)
+    return callcmdl(args)
+
+def callcmdpipe(c1, c2):
+    # Run two command strings piped together, c1 | c2
+
+    verbose(["$ %s | %s" % (c1, c2)], 2)
+    
+    # Basic security checks that our commands have full paths
+    
+    c1_list = shlex.split(c1)
+    if not re.match(r'^/', c1_list[0]):
+        abort("callcmdpipe c1 requires full path exe: " + c1_list[0])
+        return
+
+    c2_list = shlex.split(c2)
+    if not re.match(r'^/', c2_list[0]):
+        abort("callcmdpipe c2 requires full path exe: " + c2_list[0])
+        return
+    
+    p1 = subprocess.Popen(c1_list, stdout=subprocess.PIPE)
+    p2 = subprocess.Popen(c2_list, stdin=p1.stdout, stdout=subprocess.PIPE)
+    p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+    output = p2.communicate()[0]
+
+    output_list = output.split('\n')
+    output_list.pop()  # Remove final blank element
+
+    verbose(output_list, 2)
+    return output_list
+
+def load_file(path):
+    # Read a file into a list, abort if path is not a file
+
+    if not os.path.isfile(path):
+        abort("load_file: not file %s" % path)
+
+    f = open(path, 'r')
+    contents = f.read()
+    f.close()
+
+    contents_list = []
+
+    if contents:
+        contents_list = contents.split('\n')
+        if not contents_list[-1]:
+            contents_list.pop()  # Remove final blank element
+
+    return(contents_list)
+
+def save_file(path, list, mode="w", perms=0o600):
+    # Save a list to a file, options to override mode to append "a" and change rwx permissions
+    # 0o600 default = Ensure file only readable by current user
+
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, perms)
+    f = os.fdopen(fd, mode)
+    contents = "\n".join(list) + "\n"  # Guarantee an end-of-line marker
+    f.write(contents)
+    f.close()
+    return
+
+def qu(s):
+    # A simple abbreviation to make code quicker to type and easier to read
+    # Also make it easier in future if we switch to a python 3 shlex
+
+    return pipes.quote(s)
+
+# This is the end of the core.py include
+
+def set_defaults(default):
+    # Program defaults and paths placed near the top of the program for easy
+    # modification
+
+    # OS environment variables can override these, command line overrides these and environment vars
+    # While we could make every default available on the command line we already have
+    # too many options already so allow override by env var without command
+    # option clutter
+
+    progname = os.path.splitext(os.path.basename(__file__))[0]  # This prog name, extension removed
+
+    # prog name osersync, default dir name osersync
+    default_check_environ(default, "dest_dir", progname)
+
+    # Synology dsm 6 default mount point for USB disks is /volumeUSB1/usbshare
+    # We allow globbing for this value so /volumeUSB? matches /volumeUSB1 but also /volumeUSB2 and
+    # we limit search depth to 2 so we don't get lost in scanning the whole usb disk
+
+    default_check_environ(default, "dir_search", "/volumeUSB?")
+    default_check_environ(default, "max_depth", 2)  # -maxdepth argument to find
+
+    # Options below here are considered experimental at this version of the code
+    
+    default_check_environ(default, "notifier", "@synology")  # Disable (set to "none") or change notifier prog
+
+    return
+
+def set_args(default):
+    # Parse the command line and set up the args object
+
+    parser = argparse.ArgumentParser()
+
+    parser.description = \
+        "Synology DSM multi-task runner: process a task list with some simple process control."
+    parser.epilog = licence_short
+
+    parser.add_argument('-D', '--dir_search', default=default["dir_search"],
+                        help='search for conditional files below (default: "%s")' % default["dir_search"])
+    parser.add_argument('-l', "--licence", "--license", action="store_true",
+                        help="display program licence and exit")
+    parser.add_argument("--max_depth", default=default["max_depth"],
+                         help="max search depth below dir_search (default: %s)" % default["max_depth"])
+    parser.add_argument('-q', '--quiet', action="store_true",
+                         help='suppress intro and summary unless alerting')
+    parser.add_argument('-t', '--task_file',
+                        help='task file containing task list')
+    parser.add_argument('-T', '--time_stamp', action="store_true",
+                        help='add time stamps to output')
+    parser.add_argument('-v', "--verbose", action='count',
+                        help="show progress, -vv for debug level")
+
+    args = parser.parse_args()
+
+    progname = os.path.basename(sys.argv[0])
+    if not args.quiet:
+        display("%s, version %s" % (progname, version))
+
+    # If user asked for full licence we show that then exit
+
+    if args.licence:
+        display(licence_full)
+        sys.exit(0)
+    elif not args.quiet:  # No output if quiet
+        display(licence_short)  # User did not ask for full licence
+
+    # Validate where possible
+    
+    if not args.task_file:
+        abort("Please specify a task file")
+
+    if not os.path.isfile(args.task_file):
+        abort("Not a file: %s" % args.task_file)
+
+    return(args)
+
+def sanitise(line):
+    # Strip comments, leading and trailing spaces etc
+    # Inline comments must have a whitespace before the # to be recognised:
+    #     This is because the os utility suite should be consistent and
+    #     #snapshot may be a valid token
+
+    line = line.strip()  # Remove leading and trailing white space
+    line = re.sub(r'^#.*', '', line)  # Make any comment lines blank
+
+    # Remove any inline comments as long as there is a preceding space
+    # We have the space requirement to allow .../#snapshot to pass through
+
+    line = re.sub(r'\s+#.*', '', line)  # Remove inline comments
+    return(line)
+
+def check_condition(line):
+    # We have a condition if a question mark is found
+    # Item to the left of ? is the condition, to the right is the task name
+    # If the condition contains a /, we assume it is a direct path to check
+    # If the condition does not contain a / we assume it is a file/dir name
+    # and we call find_condition_target to look for it.
+
+    if not re.search('\?', line):  # Do we have a condition?
+        return(line)
+
+    line_list = line.split('?')
+
+    if len(line_list) != 2:
+        abort("Conditional line syntax error: %s [ %d ]" % (
+            line, len(line_list)))
+
+    condition = sanitise(line_list[0])
+    task_name = sanitise(line_list[1])
+
+    if re.search(os.sep, condition):  # Path given, no search
+        if os.path.exists(condition):
+            verbose(["Conditional path confirmed: %s" % 
+                     os.path.realpath(condition)])
+            return task_name
+        else:
+            verbose(["Conditional path missing: %s" % 
+                     os.path.realpath(condition)])
+            return None
+
+    if find_condition_target(condition):
+        return(task_name)
+
+    return None
+
+def find_condition_target(target):
+    # Scan from usb mount point (or DIR_SEARCH) looking for target file/dir
+
+    # We allow (even require) shell wild card characters in search_path to deal with multiple volumes and/or usb devices
+    # Use glob.glob to expand to a list of search points
+
+    prefix_list = glob.glob(args.dir_search)
+
+    if not prefix_list:
+        abort("No search path at: %s" % args.dir_search)
+
+    # Note: In find below no -type restriction and -quit means exit on first
+    # match
+
+    output_list = callcmdl(["/bin/find"] + 
+                           prefix_list + 
+                           ["-maxdepth", str(default["max_depth"]),
+                            "-name", target,
+                            "-print",
+                            "-quit"])
+
+    if not output_list:
+        verbose(["Not found condition target: %s" % target])
+        return False
+
+    verbose(["Found condition target: %s" % output_list[0]])
+
+    return True
+
+def at_cmd(task_name):
+    # Process osmtask @sleep and @waitno commands
+
+    if re.match('@sleep', task_name):
+        param = re.sub(r'^\S+\s+', '', task_name)
+        if not param.isdigit():
+            abort("@sleep duration not integer: %s" % task_name)
+        time.sleep(int(param))  # pause n seconds
+        verbose(["%s completed" % task_name])
+
+    elif re.match('@waitno', task_name):
+        param = re.sub(r'^\S+\s+', '', task_name)
+
+        # Always wait 5 seconds before checking in case process just firing up
+        time.sleep(5)
+
+        max_wait = 23 * 60 * 60  # Max wait 23 hours in seconds
+        loop_delay = 10  # 10 seconds between checks
+        count_limit = int(max_wait / loop_delay)
+
+        count = 0
+        # is_running checks entire command line
+        while is_running(param) and (count <= count_limit):
+            time.sleep(loop_delay)
+            count += 1
+
+        if count > count_limit:
+            alert("%s timed out" % task_name)
+        else:
+            delay = count * loop_delay  # Not including mandatory initial wait
+            verbose(["%s complete, waited %d seconds" % (task_name, delay)])
+
+    else:
+        return False  # Not a control statement
+
+    return True
+
+def is_running(text):
+
+    # Do any of the running processes include "text" on their command lines?
+
+    ps_list = callcmdl(["/bin/ps", "-eo", '%a'])  # Just the command lines, no pids etc
+    verbose(ps_list, 2)
+
+    for l in ps_list:
+        # Exclude our ps as a safety precaution
+        if re.search(text, l) and (not re.match("/bin/ps -eo %a", l)):
+            return True
+
+    return False
+
+def run_task(run_name, tasks_run):
+    # We have a task name we want to run
+    # List all the tasks the task scheduler has, then query each in turn
+    # looking for a name match
+
+    verbose(["Run task: %s" % task_name], 2)
+
+    output_list = callcmdl(["/usr/syno/bin/synoschedtask", "--get"])  # Dump all info about all tasks
+
+    id_list = get_task_value(output_list, "ID")  # Filter to just a list of ID numbers
+
+    started = False
+
+    for id in id_list:
+        id_info = callcmdl(["/usr/syno/bin/synoschedtask", "--get", "id=%s" % id])
+        taskname = get_task_value(id_info, "Name")[0]
+        taskowner = get_task_value(id_info, "Owner")[0]
+        taskcmd = get_task_value(id_info, "Command")[0]
+        taskstate = get_task_value(id_info, "State")[0]
+
+        if taskname != run_name:
+            continue
+
+        if (taskstate.lower() == "enabled"):
+            verbose(["Starting via task manager: %s" % taskname ])
+            # synoschedtask --run id=$id check_time=0
+            callcmdl(["/usr/syno/bin/synoschedtask", "--run", "id=%s" % id, "check_time=0"])
+            tasks_run += 1
+            started = True
+            break
+        else:
+            alert("Cannot start disabled task: %s" % taskname)
+
+    if not started:
+        alert("Could not find task: %s" % run_name)
+    else:
+        verbose(["Total run count: %d" % tasks_run], 2)
+
+    return tasks_run
+
+
+def get_task_value(input_list, select_field):
+    # Scan a list looking for a line starting with the select_field
+    # then grab the value in the square brackets
+
+    match_list = []
+    for l in input_list:
+        pattern = '\s*%s:' % select_field
+        if re.match(pattern, l):
+            value = re.search(r'\[(.*)\]', l)
+            if not value:
+                abort("Unknown value")
+
+            match_list.append(value.group(1))
+
+    return(match_list)
+
+def summary(tasks_run, alerts_triggered):
+
+    # End of program summary line
+
+    dt_obj = datetime.datetime.now()
+    dt = dt_obj.strftime('%Y-%m-%d %H:%M')
+
+    m1 = "%d tasks" % tasks_run if (tasks_run != 1) else "1 task"
+    m2 = "%d alerts" % alerts_triggered if (
+        alerts_triggered != 1) else "1 alert"
+
+    msg = "%s, %s" % (m1, m2)
+
+    if (not args.quiet) or alerts_triggered:
+        display(msg)
+        notify(dt + " : " + msg)
+
+# ###
+# Main code block
+# ###
+
+alerts_triggered = 0  # Caution: alerts_triggered is used as a global in functions
+tasks_run = 0
+
+default = {}  # Dictionary of program default values
+
+set_defaults(default)
+
+args = set_args(default)  # Load command line parameters
+
+if os.geteuid():
+    abort("Must run as root")  # Task scheduler will ignore run unless root
+
+verbose(["dir_search search: " + args.dir_search])
+
+task_file_contents = load_file(args.task_file)
+
+verbose(task_file_contents, 2)
+
+# Main processing loop, line by line over task file
+
+for l in task_file_contents:
+    sl = sanitise(l)  # Remove comments, white space
+
+    if not sl:  # Blank line/comment line
+        continue
+
+    verbose(["> " + sl])
+
+    task_name = check_condition(sl)  # If condition fails None is returned
+
+    if not task_name:  # Empty line or comment line
+        continue
+
+    if at_cmd(task_name):  # Is this @sleep, @waitno
+        continue
+
+    tasks_run = run_task(task_name, tasks_run)
+
+# Finished processing task list so summary and exit
+
+summary(tasks_run, alerts_triggered)
+
+if alerts_triggered > 0:  # Exit non-zero on alerts
+    sys.exit(1)
+
+sys.exit(0)
