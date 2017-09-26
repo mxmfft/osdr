@@ -1,0 +1,844 @@
+#!/usr/bin/python2.7
+
+import sys
+import os
+import re
+import argparse
+import subprocess
+import datetime
+import glob
+
+version = "1.2"
+
+# include licence.py
+# Text from licence.py
+
+copyright = "Copyright (c) 2017, Chris Baker <osdr@ctac.me.uk> \n"
+
+licence_short = copyright + "This software is made available under the MIT License, please use -l to display."
+
+licence_full = """
+MIT License
+
+""" + copyright + """
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+"""
+
+def set_defaults(default):
+    # Program defaults and paths placed near the top of the program for easy modification
+
+    # OS environment variables can override these, command line overrides these and environment vars
+    # While we could make every default available on the command line we already have
+    # too many options already so allow override by env var without command option clutter
+
+    progname = os.path.splitext(os.path.basename(__file__))[0]  # This prog name, extension removed
+
+    default_check_environ(default, "dest_dir", progname)  # prog name osersync, default dir name osersync
+
+    # Synology dsm 6 default mount point is /volumeUSB1/usbshare
+    # We allow globbing for this value so /volumeUSB? matches /volumeUSB1 but also /volumeUSB2 and
+    # we limit search depth to 2 so we don't get lost in scanning the whole usb disk
+
+    default_check_environ(default, "dir_search", "/volumeUSB?")
+    default_check_environ(default, "max_depth", 2)  # -maxdepth argument to find
+
+    default_check_environ(default, "track_file", progname + ".txt")
+    default_check_environ(default, "history_days", 60)
+
+    default_check_environ(default, "alert_disk_count", 3)
+    default_check_environ(default, "alert_update_age", 1)  
+    
+    default_check_environ(default, "alert_disk_age", 15)
+    default_check_environ(default, "alert_swap_age", 7)
+    default_check_environ(default, "alert_free_space", 5)
+
+    default_check_environ(default, "notifier", "@synology")  # Assume @synology, "none" = disable
+    return
+
+def set_args():
+
+    # Parse the command line and set up the args object
+
+    parser = argparse.ArgumentParser()
+    
+    parser.description = \
+        "Keep track of the rotation and free space of USB disks"
+
+    parser.epilog = licence_short
+
+    parser.add_argument('--alert_disk_age', '--ada', type=int, default=default["alert_disk_age"],
+                        help="alert if disk data (default: %d) days old" % default["alert_disk_age"])
+    parser.add_argument('--alert_disk_count', '--adc', type=int, default=default["alert_disk_count"],
+                        help="alert if monitored disk count below (default: %d)" % default["alert_disk_count"])
+    parser.add_argument('--alert_free_space', '--afs', type=int, default=default["alert_free_space"],
+                        help='alert if disk free space at/below (default: %d)' % default["alert_free_space"] + '%%')
+    parser.add_argument('--alert_swap_age', '--asa', type=int, default=default["alert_swap_age"],
+                        help="alert if same disk connected for (default: %d) days" % default["alert_swap_age"])
+    parser.add_argument('-D', '--dir_search', default=default["dir_search"],
+                        help='search for track_file below (default: "%s")' % default["dir_search"])
+    parser.add_argument('-f', '--history_file',
+                        help="store history records in this file")
+    parser.add_argument('-H', '--history_days', type=int, default=default["history_days"],
+                        help="remove history records older than (default: %d) days" % default["history_days"])
+    parser.add_argument('-l', "--licence", "--license", default=False, action="store_true",
+                        help="display program licence")
+    parser.add_argument("--max_depth", default=default["max_depth"],
+                        help="max search depth below dir_search (default: %s)" % default["max_depth"])
+    parser.add_argument('--no_alert_not_found', '--nanf', default=False, action="store_true",
+                        help="do not alert if track file not found")
+    parser.add_argument('-q', "--quiet", default=False, action="store_true",
+                        help="suppress intro and summary unless alerting")
+    parser.add_argument('--remove', help="remove records containing disk label name, prevents all other updates and checks")
+    parser.add_argument('-t', '--track_file', default=default["track_file"],
+                        help="file on USB disk containing disk label name (default: %s)" % default["track_file"])
+    parser.add_argument('-T', '--time_stamp', action="store_true",
+                        help='add time stamps to output')
+    parser.add_argument('-v', "--verbose", action='count',
+                        help="show progress, -vv for debug level")
+
+    args = parser.parse_args()
+
+    progname = os.path.basename(sys.argv[0])
+    if not args.quiet:
+        display("%s, version %s" % (progname, version))
+
+    # If user asked for full licence we show that then exit
+
+    if args.licence:
+        display(licence_full)
+        sys.exit(0)
+    elif not args.quiet:  # No output if quiet
+        display(licence_short)  # User did not ask for full licence
+
+    # Check the history dir is defined and exists
+
+    if not args.history_file:
+        abort("Must set --history_file")
+
+    args.history_file = os.path.realpath(args.history_file)  # Ensure we have a full path
+
+    return(args)
+
+# include core.py
+# This is the core.py library include
+# We only want to distribute 1 file so we pre-process includes into 1 python file
+
+# It is possible that the program you are looking at does not use all
+# of these functions. This is a standard library block for all of the
+# OSDR tools.
+
+def default_check_environ(default, key, value):
+    # Allow shell environment variables to override defaults
+    # Set default[key]=value unless environment variable progname_key overrides
+
+    # Assume this program is called osersync, key is "rsync_user", value is "root"
+    # So set default["rsync_user"] = "root" or, if osersync_rsync_user exists,
+    # default["rsync_user"] = $osersync_rsync_user
+
+    # NB: If running this program using sudo, depending on how you set the env vars you may need sudo -E
+    
+    # Set progname_defaults to anything to list all defaults at runtime
+
+    progname = os.path.splitext(os.path.basename(__file__))[0]  # This prog name, extension removed
+
+    evarname = progname + "_" + key  # Program name (no extension) underscore key name
+
+    if evarname in os.environ:
+        default[key] = os.environ[evarname]
+    else:
+        default[key] = value
+        
+    if "%s_defaults" % progname in os.environ:  
+        verbose([ "* %s_defaults : default[%s] = %s" % (progname, key, default[key])], 0)
+
+    return
+
+def display(line):
+    # Print line to stdout
+    # Using display rather than just print allows us to process output (e.g.
+    # timestamp/flush) or redirect it
+
+    if ("args" in globals()) and args.time_stamp:  # Just in case display called bofore args set
+        dt_obj = datetime.datetime.now()
+        dt = dt_obj.strftime('%Y-%m-%d %H:%M:%S')
+        line = dt + " " + line
+
+    print line
+    sys.stdout.flush()
+    return
+
+def verbose(msg_list, level=1):
+    # Display the incoming message if at, or below the current verbose level
+    # If we are -v (level 1) then only display level 1 messages, ignore level 2
+    # If we are -vv (level 2) then display both level 1 and 2
+    # If no -v options at all, we are at level 0 and skip all verbose messages
+
+    # If args is not set we are trying to print before setting up at the top
+    # of the code so just ignore the -v level and print anyway
+    
+    try:
+        args
+    except NameError:
+        True
+    else:
+        if args.verbose < level:
+            return
+
+    for l in msg_list:
+        display(l)
+
+    return
+
+def notify(alert_msg):
+    # Use the host notify program to send a notification to the administrator
+    
+    # As a common core function used by different programs try to be very 
+    # careful to check if the default global dictionary exists, if we have 
+    # a "notifier" member and if we have an args.notifier override.
+    
+    # Caution: alert() calls notify() so notify() must not call alert()
+
+    myfname = os.path.basename(sys.argv[0])  # Filename+extension of path used to call this program
+    myname = os.path.splitext(myfname)[0]  # Remove extension
+
+    notify_tag = "none"  # Disable notify as first step
+    
+    # Check if we have default and then if we have default["notifier"]
+    
+    try:
+        default
+    except NameError:
+        True
+    else:
+        if "notifier" in default:
+            notify_tag = default["notifier"]      
+    
+    # Check if we have args and then if we have args.notifier
+    
+    try:
+        args
+    except NameError:
+        True
+    else:
+        if hasattr(args, 'notifier'):
+            notify_tag = args.notifier
+    
+    # Check if there is a notifier override for all osdr tools
+    
+    if "osdr_notifier" in os.environ:
+        notify_tag = os.environ["osdr_notifier"]
+        
+    # Check if notifier is disabled
+
+    if ((not notify_tag) or (notify_tag.lower() == "none")) :
+        # Notifier disabled or not declared
+        verbose(["Notifier disabled"], 2)
+        return
+
+    verbose(["Notify: " + notify_tag], 2)  # Debug tracing
+    
+    # Next we check if notifier is built-in
+    # By convention, we use a leading @ to indicate select a built-in
+    # We still check to see if the built in exists and, if not, return quietly
+
+    if notify_tag.lower() == "@synology":
+        synology = "/usr/syno/bin/synodsmnotify"
+
+        if os.path.exists(synology):
+            # If we are on Synology use the synodsmnotify function
+            callcmdl([synology, "@administrators", myname, alert_msg])
+        return
+
+    # Add any new built-ins here using @synology as a template
+
+    # Not disabled, not built-in, try calling the program with 2 positional
+    # arguments, name and message. Likelihood is this is calling a user written
+    # external wrapper script around whatever actual function is being invoked.
+
+    if os.path.exists(notify_tag):
+        callcmdl([notify_tag, myname, alert_msg])
+    else:
+        # Do not call alert as alert calls notify
+        display("Requested notifier missing: " + notify_tag)
+
+    return
+
+def alert(alert_msg):
+    # Send message to both stdout and to notify, set global variable alert_triggered
+    # No need for stderr as dsm forwards both stdout and stderr by email and mixing
+    # stdout and stderr could mess up message sequence.
+
+    # Just about every fn could alert, don't want to hand this around on every
+    # call line
+
+    alert_msg = "> Alert: " + alert_msg  # > to make it easier to spot alerts in emailed output
+    notify(alert_msg)
+    display(alert_msg)
+
+    if "alerts_triggered" in globals():  # Just in case caller not counting alerts
+        global alerts_triggered
+        alerts_triggered += 1
+
+    return
+
+def abort(abort_msg):
+    # Use alert to send messages then exit non-zero
+
+    alert(abort_msg)
+    print "Terminating run"
+    sys.exit(1)
+    return
+
+def callcmdl(cmdlist, setcwd=""):
+    # call command list: Run a linux command from a list of tokens
+    # Catch any non-zero return codes, convert the output to a list and return
+    # Caution: stderr will go out to main stderr
+    # Optional: Set working dir [ reason: errors from /bin/find if cannot access cwd ]
+
+    # First we do a security check, insist on full path for first argument
+    
+    exefile = cmdlist[0];
+    if not re.match(r'^/', exefile):
+        abort("callcmdl requires full path exe: " + exefile)
+        return
+        
+    cmdline = " ".join(cmdlist)  # Only used for printing, not running
+    if setcwd:
+        cmdline = "[ cwd = %s ] " % setcwd + cmdline
+    verbose(["$ " + cmdline], 2)
+
+    rc = 0
+    try:
+        if not setcwd:
+            output = subprocess.check_output(cmdlist)
+        else:
+            output = subprocess.check_output(cmdlist, cwd=setcwd)
+    except subprocess.CalledProcessError as e:
+        rc = e.returncode
+        output = str(e.output)
+
+    if rc:
+        alert("Caution: non-zero return code from: " + cmdline)
+
+    output_list = output.split('\n')
+    output_list.pop()  # Remove final blank element
+
+    verbose(output_list, 2)
+    return output_list
+
+def callcmd(cmdstr, setcmd=""):
+    # Run a single string command line.
+    # Split into tokens with shlex and hand off to callcmdl
+
+    # No need for verbose echo of cmdstr as callcmdl will do that for us
+
+    args = shlex.split(cmdstr)
+    return callcmdl(args, setcmd)
+
+def callcmdpipe(c1, c2):
+    # Run two command strings piped together, c1 | c2
+
+    verbose(["$ %s | %s" % (c1, c2)], 2)
+    
+    # Basic security checks that our commands have full paths
+    
+    c1_list = shlex.split(c1)
+    if not re.match(r'^/', c1_list[0]):
+        abort("callcmdpipe c1 requires full path exe: " + c1_list[0])
+        return
+
+    c2_list = shlex.split(c2)
+    if not re.match(r'^/', c2_list[0]):
+        abort("callcmdpipe c2 requires full path exe: " + c2_list[0])
+        return
+    
+    p1 = subprocess.Popen(c1_list, stdout=subprocess.PIPE)
+    p2 = subprocess.Popen(c2_list, stdin=p1.stdout, stdout=subprocess.PIPE)
+    p1.stdout.close()  # Allow p1 to receive a SIGPIPE if p2 exits.
+    output = p2.communicate()[0]
+
+    output_list = output.split('\n')
+    output_list.pop()  # Remove final blank element
+
+    verbose(output_list, 2)
+    return output_list
+
+def load_file(path):
+    # Read a file into a list, abort if path is not a file
+
+    if not os.path.isfile(path):
+        abort("load_file: not file %s" % path)
+
+    f = open(path, 'r')
+    contents = f.read()
+    f.close()
+
+    contents_list = []
+
+    if contents:
+        contents_list = contents.split('\n')
+        if not contents_list[-1]:
+            contents_list.pop()  # Remove final blank element
+
+    return(contents_list)
+
+def save_file(path, list, mode="w", perms=0o600):
+    # Save a list to a file, options to override mode to append "a" and change rwx permissions
+    # 0o600 default = Ensure file only readable by current user
+
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT, perms)
+    f = os.fdopen(fd, mode)
+    if list:
+        contents = "\n".join(list) + "\n"  # Guarantee an end-of-line marker
+    else:
+        contents = ""
+        
+    f.write(contents)
+    f.truncate()
+    f.close()
+    return
+
+def qu(s):
+    # A simple abbreviation to make code quicker to type and easier to read
+    # Also make it easier in future if we switch to a python 3 shlex
+
+    return pipes.quote(s)
+
+# This is the end of the core.py include
+
+def day_days(count):
+    # Pluralise day/days depending on integer
+    
+    if count == 1:
+        msg = "1 day"
+    else:
+        msg = "%d days" % count
+        
+    return(msg)
+
+def remove_disk_from_history(history_file):
+    # Remove disks with matching label from history file
+    # We save then exit as remove may not be combined with update/check
+    
+    if not args.remove:
+        return
+    
+    verbose(["Remove disk from history: %s" % args.remove])
+    
+    new_history_file = []
+    removed = 0
+    
+    for line in history_file:
+        hfparse = parse_hf_line(line)
+        if hfparse["label"] != args.remove:
+            new_history_file.append(line)
+        else:
+            removed += 1
+    
+    save_file(args.history_file, new_history_file)  # Save updated history file
+    
+    if not args.quiet:
+        msg = "Removed %d records: %s" % (removed, args.remove)
+        msg = re.sub(" 1 disks", " 1 disk", msg) 
+        display(msg)
+ 
+    sys.exit(0)  # Exit, do not return
+    
+def record_age_filter(history_file):
+    # Remove records once they get to xx days so file doesn't grow forever
+    
+    if args.history_days == 0:
+        return(history_file)
+    
+    verbose(["Remove old history records (keep: %s)" % day_days(args.history_days)])
+    
+    new_history_file = []
+    removed = 0
+        
+    dt_now = datetime.datetime.now()
+       
+    for line in history_file:
+        hfparse = parse_hf_line(line)
+
+        diff_seconds = (dt_now - hfparse["dt_obj"]).total_seconds()
+        diff_days = int((diff_seconds / (24 * 60 * 60)) + 0.5)
+
+        verbose(["%2d days: " % diff_days + line], 2)
+        
+        if diff_days <= args.history_days:
+            new_history_file.append(line)
+        else:
+            removed += 1
+            
+    msg = "Removed %d records" % removed
+    msg = re.sub(" 1 records", " 1 record", msg)
+    verbose([msg])
+    return(new_history_file)
+    
+def load_history_file():
+    # Load any existing history_file into an array else create an empty array
+    
+    history_file = []
+    
+    if args.history_file and os.path.exists(args.history_file):
+        history_file = load_file(args.history_file)
+
+    # If we have a final blank line, remove it 
+    
+    if len(history_file) > 0:
+        if (history_file[-1].strip() == ""):
+            del history_file[-1]
+            
+    return (history_file)
+        
+def find_track_file():
+
+    # Scan from DIR_SEARCH looking for track file name
+
+    # We allow shell wild card characters in dir_search to deal with multiple volumes and/or usb devices
+    # Use glob.glob to expand to a list of search points
+
+    prefix_list = glob.glob(args.dir_search)  # Expand any wildcards in DIR_SEARCH via shell matching
+
+    if not prefix_list:
+        msg = "No search path at: %s" % args.dir_search
+        if not args.no_alert_not_found:
+            alert(msg)
+        else:
+            # no_alert_not_found requested 
+            display(msg)
+        return
+
+    verbose(["Searching for '%s' from: %s " % (args.track_file, prefix_list)])
+
+    # Note: Experienced find errors when a root owned osmtask called a non-root osutask.
+    # find complains if it cannot access (cd?) current working dir so to avoid making
+    # it necessary to put an odd cd in the osutrack task we set a dummy but world rwx
+    # working dir for find here to /tmp
+    
+    setcwd = "/tmp"  # Not actually used, avoids find errors if cwd not rx by osutrack process
+    
+    output_list = callcmdl(
+            ["/bin/find"] + prefix_list + ["-maxdepth",
+                                      str(args.max_depth),
+                                      "-type", "f",
+                                      "-name", args.track_file,
+                                      "-print",
+                                      "-quit"], setcwd)
+
+
+    if not output_list:
+        msg = "Not found track file: %s" % args.track_file
+        if not args.no_alert_not_found:
+            alert(msg)
+        else:
+            # no_alert_not_found requested 
+            display(msg)
+        return
+
+    # We only process first, use realpath for safety & use in debugging
+    track_file = os.path.realpath(output_list[0])
+
+    if len(output_list) > 2:  # Should be impossible with find -quit, but for future expansion
+        alert("Only processing first track file found")
+        verbose(["For info only, all found paths: %s" % output])
+
+    verbose(["Found track file : %s" % track_file])
+
+    return(track_file)
+
+def read_label(path):
+
+    # Read the first line of the file provided, replace non-supported label chars with underscore
+    # then truncate to a maximum of 32 characters.
+
+    contents_list = load_file(path)
+
+    if not contents_list:
+        abort("No label available in: %s" % path)
+
+    line = contents_list[0].strip()  # Remove newline and start/end white space
+
+    line = re.sub(r'[^A-Za-z0-9_\-+]', '_', line)  # Replace non-std characters with underscore
+
+    if len(line) > 32:
+        line = line[:32]
+
+    if len(line) < 1:
+        abort("Missing label from track file: %s" % path)
+
+    verbose(["Track file label: %s" % line])
+
+    return(line)
+
+def update_history_file(history_file):
+
+    # Update the history record file for the connected usb disk to add today's date/time and free space info
+    # Finally truncate history file to a maximum number of lines
+
+    track_file_path = find_track_file()  # First locate the track file
+
+    if not track_file_path:  # Did not find track file
+        return(history_file)  # Return unchanged
+
+    label = read_label(track_file_path)
+
+    if not label:  # Missing or empty label
+        return(history_file)  # Return unchanged
+
+    # df -H
+    # /dev/sdq1          985G  681G  304G  70% /volumeUSB1/usbshare
+
+    df = subprocess.Popen(["df", '-H', track_file_path],
+                          stdout=subprocess.PIPE)
+    output = df.communicate()[0]
+    device, size, used, available, percent, mountpoint = output.split("\n")[
+        1].split()
+
+    # df reports %full, convert to %free
+    free = 100 - int(re.sub('%', '', percent))
+
+    # construct the new line to add to the file
+
+    dt_obj = datetime.datetime.now()
+    dt = dt_obj.strftime('%Y-%m-%d %H:%M [%a]')
+    newline = "%s # Size: %s, Used: %s, Avail: %s, Free: %s%% # %s" % (
+        dt, size, used, available, free, label)
+
+    verbose([newline.rstrip('\n')])
+    
+    history_file = [newline] + history_file
+
+    return(history_file)
+
+def parse_hf_line(line):
+    
+    # 2017-09-14 19:29 [Thu] # Size: 985G, Used: 740G, Avail: 245G, Free: 24% # Hitachi_1TB_Yellow
+
+    output = {};
+    
+    dt_str = re.sub(r' \[.*', '', line.strip())  # Chop off # file space info
+
+    # convert string to datetime object
+    
+    dt_obj = datetime.datetime.strptime(dt_str, '%Y-%m-%d %H:%M')
+    output["dt_obj"] = dt_obj
+    
+    label = re.sub(r'.*# *', '', line.strip())  # Chop off everything up to final # and following space
+    output["label"] = label
+    
+    space = re.sub(r'% *#[^#]*', '', line.strip());  # Chop off from % of Free: 24% and label 
+    space = re.sub(r'.*, Free: *', '', space)  # Chop off everything up to first Free:    
+    output["free_pc"] = space
+    
+    return(output)
+
+def check_disk_count(history_file):
+
+    # Check each history record in turn to see if last update age is at alert level
+    # Calculate time offset using date on last line of file
+
+    if args.alert_disk_count == 0:  # Disable check by setting to zero
+        return
+
+    verbose(["Check disk count at least %d" % args.alert_disk_count])
+ 
+    found_labels = {}
+    
+    if not history_file:
+        verbose(["History file is empty"], 2)
+    else:
+        for line in history_file:
+            hfparse = parse_hf_line(line)
+            
+            if not (hfparse["label"] in found_labels):  # First (i.e. newest) record for this disk
+                found_labels[hfparse["label"]] = 1
+            
+    
+    dcount = len(found_labels)
+    
+    if dcount < args.alert_disk_count:
+        msg = "Only %d disks counted" % dcount
+        if dcount == 1:
+            msg = re.sub('disks', 'disk', msg)
+        alert(msg)
+    else:
+        verbose(["Disk count check ok: %d " % dcount])
+
+    return
+
+def check_disk_days(history_file):
+
+    # Check each history record in turn to see if last update age is at alert level
+    # Calculate time offset using date on last line of file
+
+    if args.alert_disk_age == 0:  # Disable check by setting to zero
+        return
+
+    verbose(["Check if disk age at/above %d days" % args.alert_disk_age])
+
+    dt_now = datetime.datetime.now()
+    
+    found_labels = {}
+    
+    if not history_file:
+        verbose(["History file is empty"], 2)
+        return
+    else:
+        for line in history_file:
+            hfparse = parse_hf_line(line)
+            
+            if not (hfparse["label"] in found_labels):  # First (i.e. newest) record for this disk
+                found_labels[hfparse["label"]] = 1
+                
+                diff_seconds = (dt_now - hfparse["dt_obj"]).total_seconds()
+                diff_days = int((diff_seconds / (24 * 60 * 60)) + 0.5)
+        
+                if diff_days >= args.alert_disk_age:
+                    alert("Disk age is %d days : %s" % (diff_days, hfparse["label"]))
+                else:
+                    verbose(["Disk age check ok: %2d days : %s" % 
+                             (diff_days, hfparse["label"])])
+
+    return
+
+def check_swap_days(history_file):
+    # Calculate how long the most recent usb disk has been connected
+    # to assess whether it is time to swap to another
+
+    if args.alert_swap_age == 0:  # Disable check by setting to zero
+        return
+
+    verbose(["Check if swap age at/above %d days" % args.alert_swap_age])
+
+    if not history_file:
+        verbose(["History file is empty"], 2)
+        return
+        
+    dt_now = datetime.datetime.now()
+    
+    disk1_label = ""
+    diff_days = -1
+    
+    for line in history_file:
+        hfparse = parse_hf_line(line)
+        
+        if (disk1_label == ""):
+            disk1_label = hfparse["label"]
+            
+        if (hfparse["label"] == disk1_label):
+            diff_seconds = (dt_now - hfparse["dt_obj"]).total_seconds()
+            diff_days = int((diff_seconds / (24 * 60 * 60)) + 0.5)
+        else:
+            # Label changed to disk2 so stop scanning
+            break
+            
+    
+    if diff_days >= args.alert_swap_age:
+        alert("Swap age is %s : %s" % (day_days(diff_days), disk1_label))
+    else:
+        verbose(["Swap age check ok: %s : %s" % 
+                 (day_days(diff_days), disk1_label)])
+
+    return
+
+def check_free_space(history_file):
+
+    # Only check the latest disk update record. Don't nag for weeks if user has freed up space
+
+    if args.alert_free_space == 0:  # Disable check by setting to zero
+        return
+
+    verbose(["Check if latest free space at/below %s%%" % args.alert_free_space])
+    
+    if not history_file:
+        # No need to alert here, we are not raising a free space concern
+        return
+    
+    hfparse = parse_hf_line(history_file[0])
+    free_int = int(hfparse["free_pc"])
+    
+    if free_int <= args.alert_free_space:
+        alert("Free space low: %d%% : %s" % (free_int, hfparse["label"]))
+    else:
+        verbose(["Free space check ok: %d%% : %s" % (free_int, hfparse["label"])])
+    return
+
+def summary(history_file):
+
+    # Simple summary message
+
+    dt_obj = datetime.datetime.now()
+    dt = dt_obj.strftime('%Y-%m-%d %H:%M')
+
+    count = 0
+    if history_file:
+        count = len(history_file)
+    
+    # Let's get the plurals right
+
+    msg_r = "record" if count == 1 else "records"
+    verbose(["%d %s in history file" % (count, msg_r)])
+    
+    msg_a = "alert" if alerts_triggered == 1 else "alerts"
+    msg = "%d %s" % (alerts_triggered, msg_a)
+
+    if (not args.quiet) or alerts_triggered:
+        display(msg)
+        notify(dt + " : " + msg)
+
+# ###
+# Main code block starts here
+# ###
+
+alerts_triggered = 0
+
+default = {}  # Dictionary of program default values
+
+set_defaults(default)
+
+args = set_args()  # Load command line parameters
+
+history_file = load_history_file()
+
+if args.remove:
+   remove_disk_from_history(history_file)  # Note: Will sys.exit(0)
+
+history_file = record_age_filter(history_file)  # Remoce records beyond age limit
+
+history_file = update_history_file(history_file)  # Find usb track file and update history record
+
+save_file(args.history_file, history_file)  # Save updated history file
+  
+check_swap_days(history_file)  # Check if most recent disk connected continuously since now - <n> days
+
+check_disk_count(history_file)  # Count number of labels in history file
+
+check_disk_days(history_file)  # Check if any record at alet_usb_days
+
+check_free_space(history_file)  # Check if any record is at/below alert_free_space
+
+summary(history_file)  # Send  notification unless quiet
+
+# Exit with appropriate status, non-zero to trigger dsm email
+
+if  alerts_triggered > 0:
+    sys.exit(1)
+
+sys.exit(0)
