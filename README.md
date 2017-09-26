@@ -8,3 +8,9 @@ These programs are written in Python 2.7 and are designed to run on Linux. The t
 The fundamental design philosophy of an OSDR supported backup and disaster recovery strategy is a multi-layered hybrid of: on-site storage redundancy; off-site, off-line storage and cloud storage.
 
 Caution: Some of these tools require “root” privilege to operate. As with any program with this privilege, bugs or misuse could cause significant damage. This software is provided to you in readable Python source code for your inspection prior to execution so use of this code is entirely at your own risk. The terms of use are spelled out formally in the MIT License included in this repository and by using the --license option in each program. If you are not willing to accept these terms of use, do not run this code.
+
+The tools currently released:
+
+* osmtask : A batch multi-task sequencer for DSM 6 with conditional task start
+
+* osutrack : An off-site disk tracker with rotation reminders and data age alerting
